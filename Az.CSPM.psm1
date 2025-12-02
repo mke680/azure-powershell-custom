@@ -155,40 +155,176 @@ New-Module -Name Az.CSPM -ScriptBlock {
         throw "Object '$Identity' not found as User, Group, or Service Principal."
     }
 
-    function New-AzRBACAssignment {
-        [CmdletBinding()]
-        param (
-            [Parameter(Mandatory)][string]$ResourceName,
-            [Parameter(Mandatory)][string]$MemberName,
-            [Parameter(Mandatory)][string]$RoleDefinition
-        )
+function New-AzRBACAssignment {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)][string]$ResourceName,
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)][string]$RoleDefinition,
 
-        $resourceObjects = Get-AzResource -Name $ResourceName -ErrorAction SilentlyContinue
-        if (-not $resourceObjects) { throw "Resource '$ResourceName' not found in the current subscription context." }
-        if ($resourceObjects.Count -gt 1) {
-            Write-Error "Multiple resources found with name '$ResourceName'. Specify one using ResourceId or include ResourceGroupName/ResourceType."
-            $resourceObjects | Select-Object Name, ResourceType, ResourceGroupName, ResourceId
+        [Parameter()][ValidateSet("Active", "Eligible")]
+        [string]$AssignmentType = "Active",
+
+        [Parameter()][datetime]$StartDateTime,
+
+        [Parameter()][datetime]$EndDateTime,
+
+        [Parameter()][string]$Justification = "Automated RBAC/PIM assignment",
+
+        # Force only allows RBAC -> PIM conversion. It WILL remove permanent RBAC if present.
+        [Parameter()][switch]$Force
+    )
+
+    try {
+        # Resolve resource
+        $resource = Get-AzResource -Name $ResourceName -ErrorAction Stop
+        if (-not $resource -or $resource.Count -eq 0) { throw "Resource '$ResourceName' not found in the current subscription context." }
+        if ($resource.Count -gt 1) {
+            Write-Error "Multiple resources found with name '$ResourceName'. Specify ResourceId or ResourceGroupName/ResourceType."
+            $resource | Select-Object Name, ResourceType, ResourceGroupName, ResourceId
             return
         }
+        $scope = $resource[0].ResourceId
 
-        $resourceId = $resourceObjects[0].ResourceId
+        # Resolve principal
+        $entra = Get-AzAdObject -Identity $MemberName
+        if (-not $entra) { throw "Principal '$MemberName' not found." }
+        $principalId = $entra.Id
 
-        $entraObject = Get-AzAdObject -Identity $MemberName
-        if (-not $entraObject) { throw "Entra object '$MemberName' not found." }
+        # Resolve role definition
+        $role = Get-AzRoleDefinition -Name $RoleDefinition -ErrorAction SilentlyContinue
+        if (-not $role) { $role = Get-AzRoleDefinition -Id $RoleDefinition -ErrorAction SilentlyContinue }
+        if (-not $role) { throw "Role definition '$RoleDefinition' not found." }
+        $roleDefinitionId = $role.Id
 
-        
-        #Try Definition Name
-        $roleDefinitionObject = Get-AzRoleDefinition -Name $RoleDefinition
-        #$roleDefinitionObject | ConvertTo-Json -Depth 5
-        #$roleDefinitionObject.Id
-        if($roleDefinitionObject) { return New-AzRoleAssignment -ObjectId $entraObject.Id -RoleDefinitionId $roleDefinitionObject.Id -Scope $resourceId }
+        # If EndDateTime not provided => permanent RBAC path
+        if (-not $PSBoundParameters.ContainsKey('EndDateTime')) {
+            Write-Verbose "Permanent RBAC mode detected (no EndDateTime provided)."
 
-        #Try Role Id
-        $roleDefinitionObject = Get-AzRoleDefinition -Id $RoleDefinition        
-        if($roleDefinitionObject) { return New-AzRoleAssignment -ObjectId $entraObject.Id -RoleDefinitionId $RoleDefinitionObject.Id -Scope $resourceId }
-        
-        throw "Definition not found"
+            $existing = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction SilentlyContinue
+
+            if ($existing) {
+                Write-Verbose "An existing permanent RBAC assignment already exists."
+                return $existing
+            }
+
+            # Create permanent RBAC
+            return New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope
+        }
+
+        # ---------- PIM mode ----------
+        Write-Verbose "PIM mode ($AssignmentType)"
+
+        # Normalize Start/End
+        if (-not $StartDateTime) { $StartDateTime = Get-Date }
+
+        # If user supplied a date-only value it will have TimeOfDay == 00:00:00.
+        # Treat that as "end of that day local" for EndDateTime.
+        if ($EndDateTime.TimeOfDay.TotalSeconds -eq 0) {
+            $EndDateTime = $EndDateTime.Date.AddDays(1).AddSeconds(-1)
+        }
+
+        $startUtc = $StartDateTime.ToUniversalTime().ToString("o")
+        $endUtc   = $EndDateTime.ToUniversalTime().ToString("o")
+
+        # Detect permanent RBAC existence
+        $rbac = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction SilentlyContinue
+
+        if ($rbac -and -not $Force) {
+            throw "Permanent RBAC assignment exists at scope $scope for principal $MemberName and role $RoleDefinition. Rerun with -Force to convert RBAC -> PIM."
+        }
+
+        if ($rbac -and $Force) {
+            Write-Warning "Force specified — converting permanent RBAC to PIM by removing existing RBAC assignment(s)."
+            foreach ($r in $rbac) {
+                # Use Remove-AzRoleAssignment to stay in Az module
+                Remove-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction Stop
+            }
+        }
+
+        # Find existing PIM assignments (schedules)
+        $pimUri = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentSchedules?api-version=2020-10-01"
+        $pimAssignments = Invoke-AzureRestMethod -Uri $pimUri -Method GET -ErrorAction SilentlyContinue
+
+        # If Invoke-AzureRestMethod paginates, it will return array. If single response, handle that.
+        $pimAssignments = @($pimAssignments) | Where-Object { $_ -ne $null }
+
+        $typeFilter = if ($AssignmentType -eq "Eligible") { "Eligible" } else { "Active" }
+
+        $existingPim = $pimAssignments | Where-Object {
+            ($_.principalId -eq $principalId) -and
+            ($_.roleDefinitionId -eq $roleDefinitionId) -and
+            ($_.scope -eq $scope) -and
+            ($_.assignmentType -eq $typeFilter)
+        }
+
+        # If PIM exists -> Auto-extend
+        if ($existingPim -and $existingPim.Count -gt 0) {
+            if ($existingPim.Count -gt 1) {
+                throw "Multiple PIM assignments found for principal/role/scope — manual intervention required."
+            }
+
+            Write-Verbose "Existing PIM found — submitting extend request."
+
+            $extendUri = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentScheduleRequests?api-version=2020-10-01"
+            $extendBody = @{
+                properties = @{
+                    requestType = "AdminExtend"
+                    principalId = $principalId
+                    roleDefinitionId = $roleDefinitionId
+                    scope = $scope
+                    justification = $Justification
+                    scheduleInfo = @{
+                        expiration = @{
+                            type = "AfterDateTime"
+                            endDateTime = $endUtc
+                        }
+                    }
+                }
+            } | ConvertTo-Json -Depth 10
+
+            $extendResp = Invoke-AzureRestMethod -Method POST -Uri $extendUri -Body $extendBody -ContentType "application/json"
+
+            if ($extendResp -and $extendResp.properties -and $extendResp.properties.status -eq "PendingApproval") {
+                Write-Warning "PIM extend request submitted and is pending approval."
+            }
+
+            return $extendResp
+        }
+
+        # Create new PIM assignment
+        $requestType = if ($AssignmentType -eq "Eligible") { "AdminAssignEligible" } else { "AdminAssign" }
+        $createUri = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentScheduleRequests?api-version=2020-10-01"
+
+        $createBody = @{
+            properties = @{
+                requestType = $requestType
+                principalId = $principalId
+                roleDefinitionId = $roleDefinitionId
+                scope = $scope
+                justification = $Justification
+                scheduleInfo = @{
+                    startDateTime = $startUtc
+                    expiration = @{
+                        type = "AfterDateTime"
+                        endDateTime = $endUtc
+                    }
+                }
+            }
+        } | ConvertTo-Json -Depth 10
+
+        $response = Invoke-AzureRestMethod -Method POST -Uri $createUri -Body $createBody -ContentType "application/json"
+
+        if ($response -and $response.properties -and $response.properties.status -eq "PendingApproval") {
+            Write-Warning "PIM create request submitted but is pending approval."
+        }
+
+        return $response
     }
+    catch {
+        throw "New-AzRBACAssignment failed: $($_.Exception.Message)"
+    }
+}
 
     # function Invoke-CspmAzGraphQuery {
     #     [CmdletBinding()]
