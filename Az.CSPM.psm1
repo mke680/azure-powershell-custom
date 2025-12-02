@@ -1,0 +1,681 @@
+New-Module -Name Az.CSPM -ScriptBlock {
+
+    ######################
+    ## Helper Functions ##
+    ######################
+
+    function Invoke-AzureRestMethod {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory)][string]$Uri,
+            [Parameter()][ValidateSet("GET", "POST", "PUT", "DELETE", "PATCH")][string]$Method = "GET",
+            [Parameter()][hashtable]$Headers = (Get-AuthHeader),
+            [Parameter()][object]$Body,
+            [Parameter()][string]$ContentType, #= 'application/json',
+            [Parameter()][bool]$Paginate = $true,
+            [Parameter()][switch]$UseBasicParsing,
+            [Parameter()][switch]$UseDefaultCredentials,
+            [Parameter()][int]$TimeoutSec = 100,
+            [Parameter()][string]$StatusCodeVariable = 'statusCode',
+            [Parameter()][string]$ResponseHeadersVariable = 'responseHeader'
+        )
+
+        try {
+            $results = @()
+
+            # Build the options for Invoke-RestMethod
+            $options = @{
+                Uri         = $Uri
+                Method      = $Method
+                Headers     = $Headers
+                TimeoutSec  = $TimeoutSec
+                ErrorAction = 'Stop'
+            }
+
+
+            if ($Body)         { $options.Body = $Body }
+            if ($ContentType)  { $options.ContentType = $ContentType }
+            if ($UseBasicParsing) { $options.UseBasicParsing = $true }
+            if ($StatusCodeVariable) { $options.StatusCodeVariable = $StatusCodeVariable }
+            if ($ResponseHeadersVariable) { $options.ResponseHeadersVariable = $ResponseHeadersVariable }
+            
+             # Handle pagination
+            if ($Paginate -and $Method -eq "GET") {
+                $nextLink = $Uri
+                while ($nextLink) {
+                    $options.Uri = $nextLink
+                    $response = Invoke-RestMethod @options
+                    if ($response.value) {
+                        $results += $response.value
+                    }
+
+                    $nextLink = $response.'nextLink'
+                }
+
+                return $results
+            } else {
+                $response = Invoke-RestMethod @options
+                $response | Add-Member -MemberType NoteProperty -Name 'statusCode' -Value $statusCode
+                $response | Add-Member -MemberType NoteProperty -Name 'headers' -Value $responseHeader
+                return $response
+            }
+        }
+        catch {
+            Write-Error "Invoke-AzureRestMethod failed: $($_.Exception.Message)"
+        }
+    }
+
+
+    function Get-AuthHeader {
+        param (
+            [string]$ResourceUrl = "https://management.azure.com"
+        )
+
+        $secureToken = (Get-AzAccessToken -ResourceUrl $ResourceUrl -AsSecureString).Token
+
+        $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+        )
+
+        return @{
+            Authorization = "Bearer $token"
+            ConsistencyLevel = "Eventual"
+        }
+    }
+
+    function ConvertTo-Guid {
+        param (
+            [Parameter(Mandatory)]
+            [string]$InputString
+        )
+
+        $sha1 = [System.Security.Cryptography.SHA1]::Create()
+        $hashBytes = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($InputString))
+        $guidBytes = $hashBytes[0..15]
+        return [System.Guid]::New([byte[]]$guidBytes)
+    }
+
+    function Resolve-CspmScope {
+        param (
+            [Parameter(Mandatory=$true)]
+            [string]$Identifier
+        )
+
+        # Ensure Azure context
+        if (-not (Get-AzContext)) {
+            throw "No Azure context found. Please login using Connect-AzAccount."
+        }
+
+        # Try resolving as subscription name
+        $sub = Get-AzSubscription | Where-Object { $_.Name -eq $Identifier -or $_.Id -eq $Identifier }
+        if ($sub) {
+            return "/subscriptions/$($sub.Id)"
+        }
+
+        # Try resolving as connector name
+        $query = @"
+            Resources 
+            | where type == "microsoft.security/securityconnectors" 
+            | where name =~ '$Identifier'
+            | project id
+"@
+
+        $match = Search-AzGraph -Query $query
+
+        #$connectors = Get-AzResource -ResourceType "Microsoft.Security/securityConnectors" -ExpandProperties
+        #$match = $connectors | Where-Object { $_.Name -eq $Identifier }
+
+        if ($match.Count -eq 1) {
+            return $match[0].id
+            #return $match.ResourceId
+        }
+
+        throw "Could not resolve identifier '$Identifier' as either a subscription or connector name."
+    }
+
+    function Get-AzAdObject {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory=$true)]
+            [string]$Identity
+        )
+
+        # Try user
+        $user = Get-AzADUser -Filter "userPrincipalName eq '$Identity' or displayName eq '$Identity'" -ErrorAction SilentlyContinue
+        if ($user) { return $user }
+
+        # Try group
+        $group = Get-AzADGroup -Filter "displayName eq '$Identity'" -ErrorAction SilentlyContinue
+        if ($group) { return $group }
+
+        # Try service principal
+        $sp = Get-AzADServicePrincipal -Filter "displayName eq '$Identity'" -ErrorAction SilentlyContinue
+        if ($sp) { return $sp }
+
+        throw "Object '$Identity' not found as User, Group, or Service Principal."
+    }
+
+    function New-AzRBACAssignment {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory)][string]$ResourceName,
+            [Parameter(Mandatory)][string]$MemberName,
+            [Parameter(Mandatory)][string]$RoleDefinition
+        )
+
+        $resourceObjects = Get-AzResource -Name $ResourceName -ErrorAction SilentlyContinue
+        if (-not $resourceObjects) { throw "Resource '$ResourceName' not found in the current subscription context." }
+        if ($resourceObjects.Count -gt 1) {
+            Write-Error "Multiple resources found with name '$ResourceName'. Specify one using ResourceId or include ResourceGroupName/ResourceType."
+            $resourceObjects | Select-Object Name, ResourceType, ResourceGroupName, ResourceId
+            return
+        }
+
+        $resourceId = $resourceObjects[0].ResourceId
+
+        $entraObject = Get-AzAdObject -Identity $MemberName
+        if (-not $entraObject) { throw "Entra object '$MemberName' not found." }
+
+        
+        #Try Definition Name
+        $roleDefinitionObject = Get-AzRoleDefinition -Name $RoleDefinition
+        #$roleDefinitionObject | ConvertTo-Json -Depth 5
+        #$roleDefinitionObject.Id
+        if($roleDefinitionObject) { return New-AzRoleAssignment -ObjectId $entraObject.Id -RoleDefinitionId $roleDefinitionObject.Id -Scope $resourceId }
+
+        #Try Role Id
+        $roleDefinitionObject = Get-AzRoleDefinition -Id $RoleDefinition        
+        if($roleDefinitionObject) { return New-AzRoleAssignment -ObjectId $entraObject.Id -RoleDefinitionId $RoleDefinitionObject.Id -Scope $resourceId }
+        
+        throw "Definition not found"
+    }
+
+    # function Invoke-CspmAzGraphQuery {
+    #     [CmdletBinding()]
+    #     param (
+    #         [Parameter(Mandatory = $true)]
+    #         [string]$Query
+    #     )
+    #
+    #     # Build ARG request body
+    #     $body = @{ query = $Query } | ConvertTo-Json -Depth 5
+    #
+    #     # ARG REST endpoint
+    #     $uri = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources`?api-version=2022-10-01"
+    #
+    #     try {
+    #         Write-Verbose "Invoking Azure Resource Graph query..."
+    #         $response = Invoke-AzureRestMethod `
+    #             -Method POST `
+    #             -Uri $uri `
+    #             -Body $body `
+    #             -Headers (Get-AuthHeader) `
+    #             -ContentType 'application/json'
+    #
+    #         if (-not $response.data) {
+    #             Write-Warning "Query returned no results."
+    #             return $response
+    #         }
+    #
+    #         # Return raw data array
+    #         return $response.data
+    #     }
+    #     catch {
+    #         throw "Failed to execute Resource Graph query: $_"
+    #     }
+    # }
+    
+    ######################
+    ## Custom Standards ##
+    ######################
+
+    function Get-CspmCustomStandard {
+        param(
+            [string]$DisplayName,
+            [string]$Id,
+            [string]$Scope = (Get-AzContext).Subscription.Id
+        )
+
+        $scope = Resolve-CspmScope -Identifier $Scope
+        if ($DisplayName) {
+            $Id = (ConvertTo-Guid $DisplayName).Guid
+        }
+
+        if ($Id) {
+            $uri = "https://management.azure.com/$Scope/providers/Microsoft.Security/securityStandards/$Id?api-version=2024-08-01"
+        } else {
+            $uri = "https://management.azure.com/$Scope/providers/Microsoft.Security/securityStandards?api-version=2024-08-01"
+        }
+
+        $response = Invoke-AzureRestMethod -Uri $uri -Method GET -Headers (Get-AuthHeader)
+        return $response
+    }
+
+    function New-CspmCustomStandard {
+        param(
+            [Parameter(Mandatory)] [string]$DisplayName,
+            [Parameter(Mandatory)] [string]$Description,
+            [Parameter(Mandatory)] [string[]]$Assessments,
+            [Parameter(Mandatory)] [string]$CloudProvider,
+            [string]$Scope = (Get-AzContext).Subscription.Id
+        )
+
+        $scope = Resolve-CspmScope -Identifier $Scope
+        $id = (ConvertTo-Guid $DisplayName).Guid
+        $uri = "https://management.azure.com/$Scope/providers/Microsoft.Security/securityStandards/$id?api-version=2024-08-01"
+
+        $body = @{ 
+            properties = @{
+                displayName    = $DisplayName
+                description    = $Description
+                standardType   = "Custom"
+                assessments    = $Assessments
+                cloudProviders = @($CloudProvider)
+            }
+        } | ConvertTo-Json -Depth 10
+
+        Invoke-AzureRestMethod -Uri $uri -Method PUT -Headers (Get-AuthHeader) -Body $body -ContentType 'application/json'
+    }
+
+    function Remove-CspmCustomStandard {
+        param(
+            [string]$DisplayName,
+            [string]$Id,
+            [string]$Scope = (Get-AzContext).Subscription.Id
+        )
+
+        $scope = Resolve-CspmScope -Identifier $Scope
+        if ($DisplayName) {
+            $Id = (ConvertTo-Guid $DisplayName).Guid
+        }
+
+        if (-not $Id) {
+            throw "Either DisplayName or Id must be provided."
+        }
+
+        $uri = "https://management.azure.com/$Scope/providers/Microsoft.Security/securityStandards/$Id?api-version=2024-08-01"
+        $response = Invoke-AzureRestMethod -Uri $uri -Method DELETE -Headers (Get-AuthHeader)
+        if($response.statusCode -eq '202'){
+            Write-Host "$($response.statusCode): Successfully Deleted $($DisplayName)" -ForegroundColor Green
+        }else{
+            Write-Error "$($response.statusCode): $($Error[0])"
+        }
+
+    }
+
+    function Update-CspmCustomStandard {
+        param (
+            [Parameter(Mandatory)][string]$Scope,
+            [Parameter(Mandatory)][string]$DisplayName,
+            [Parameter(Mandatory)][string[]]$Assessments,
+            [Parameter()][string]$Description = $DisplayName,
+            [Parameter()][string]$CloudProvider = "AWS"
+        )
+
+        $scope = Resolve-CspmScope -Identifier $Scope
+        $standardId = (ConvertTo-Guid $DisplayName).Guid
+
+        $body = @{
+            properties = @{
+                displayName    = $DisplayName
+                description    = $Description
+                standardType   = "Custom"
+                assessments    = @($Assessments)
+                cloudProviders = @($CloudProvider)
+            }
+        } | ConvertTo-Json -Depth 10
+
+        $uri = "https://management.azure.com/$Scope/providers/Microsoft.Security/securityStandards/$standardId?api-version=2024-08-01"
+
+        Invoke-AzureRestMethod -Method PUT -Uri $uri -Headers $script:CspmAuthHeader -Body $body -ContentType 'application/json'
+    }
+
+    #####################
+    ## Governance Rule ##
+    #####################
+
+    function New-CspmGovernanceRule {
+        param (
+            [Parameter(Mandatory = $false)][string]$Scope,
+            [Parameter(Mandatory)][string]$DisplayName,
+            [Parameter(Mandatory)][string]$Description = $DisplayName,
+            [Parameter(Mandatory)][string[]]$ConditionList,
+            [Parameter(Mandatory)][string]$Owner,
+            [Parameter(Mandatory)][string]$Priority,
+            [boolean]$includeMember = $true,
+            [string]$remediationTimeframe = "365.00:00:00",
+            [switch]$Severity,
+            [switch]$Category,
+            [switch]$Risk,
+            [switch]$Assessment,
+            [switch]$TenantRoot
+        )
+
+        # Validate mutually exclusive switches
+        $enabledSwitches = @(
+            if ($Severity)  { 'Severity' }
+            if ($Risk)      { 'Risk' }
+            if ($Assessment){ 'Assessment' }
+        )
+
+        if ($enabledSwitches.Count -gt 1) {
+            throw "Only one specified at a time: Severity, Risk, Assessment. Provided: $($enabledSwitches -join ', ')"
+        }
+        
+        # Determime Scope
+        if($TenantRoot){
+        # Resolve tenant root MG scope using tenant ID
+            $tenantId = (Get-AzContext).Tenant.Id
+            $resolvedScope = "/providers/Microsoft.Management/managementGroups/$tenantId"
+        }elseif($scope){
+            $resolvedScope = Resolve-CspmScope -Identifier $Scope
+        }else{
+            throw "Either -Scope or -TenantRoot must be specified."
+        }
+
+
+        if($Severity){
+            $Condition = "properties.metadata.severity"
+        }elseif($Risk){ 
+            $Condition = "properties.metadata.risk"
+        }elseif($Category){
+            $Condition = "properties.metadata.recommendationCategory"
+        }elseif($Assessment){
+            $Condition = "name"
+        }else{
+            throw "You must specify one condition to determine the governance rule condition: -Severity, -Risk, -Category or -Assessment."
+        }
+
+        # Generate Deterministic GUID
+        $ruleId = (ConvertTo-Guid $DisplayName).Guid
+
+        $body = @{
+            properties = @{
+                displayName    = $DisplayName
+                description    = $Description
+                remediationTimeframe = $remediationTimeframe
+                includeMemberScopes = $includeMember
+                isGracePeriod = $true
+                rulePriority = $priority
+                isDisabled = $false
+                ruleType = "Integrated"
+                sourceResourceType = "Assessments"
+                conditionSets = @(@{
+                    conditions = @(@{
+                        property = $Condition
+                        value    = ConvertTo-Json -InputObject $ConditionList -compress
+                        operator = "In"
+                    })
+                })
+                ownerSource = @{
+                    ownerType = "Group"
+                    type      = "Manually"
+                    value     = $Owner
+                }
+                governanceEmailNotification = @{
+                    disableManagerEmailNotification = $true
+                    disableOwnerEmailNotification = $false
+                }
+                excludedScopes = @()
+            }
+        } | ConvertTo-Json -Depth 10
+        Write-Host $body
+        $uri = "https://management.azure.com/$resolvedScope/providers/Microsoft.Security/governanceRules/$ruleId`?api-version=2022-01-01-preview"
+        Write-Host $uri
+        Invoke-AzureRestMethod -Method PUT -Uri $uri -Headers (Get-AuthHeader) -Body $body -ContentType 'application/json'
+    }
+
+    function Get-CspmGovernanceRule {
+        param (
+            [Parameter(Mandatory = $false)][string]$Scope,
+            [Parameter(Mandatory = $false)][string]$DisplayName,
+            [switch]$TenantRoot
+        )
+
+        # Resolve Scope
+        if($TenantRoot){
+            $tenantId = (Get-AzContext).Tenant.Id
+            $resolvedScope = "/providers/Microsoft.Management/managementGroups/$tenantId"
+        }elseif($scope){
+            $resolvedScope = Resolve-CspmScope -Identifier $Scope
+        }else{
+            throw "Either -Scope or -TenantRoot must be specified."
+        }
+    
+        # Optional filter by DisplayName (deterministic GUID)
+        if ($DisplayName) {
+            $ruleId = (ConvertTo-Guid $DisplayName).Guid
+            $uri = "https://management.azure.com/$resolvedScope/providers/Microsoft.Security/governanceRules/$ruleId?api-version=2022-01-01-preview"
+        } else {
+            $uri = "https://management.azure.com/$resolvedScope/providers/Microsoft.Security/governanceRules?api-version=2022-01-01-preview"
+        }
+
+        try{
+            $response = Invoke-AzureRestMethod -Method GET -Uri $uri -Headers (Get-AuthHeader)
+            return $response
+        } catch {
+            throw "Failed to GET governance rules for $($Scope) $($DisplayName): $_"
+        }
+    }
+    
+    # function Get-CspmGovernanceRule {
+    #     [CmdletBinding()]
+    #     param (
+    #         [Parameter(Mandatory = $false)][string]$Scope,
+    #         [Parameter(Mandatory = $false)][string]$DisplayName,
+    #         [switch]$TenantRoot
+    #     )
+    #
+    #     # Resolve Scope
+    #     if ($TenantRoot) {
+    #         $tenantId = (Get-AzContext).Tenant.Id
+    #         $resolvedScope = "/providers/Microsoft.Management/managementGroups/$tenantId"
+    #     } elseif ($Scope) {
+    #         $resolvedScope = Resolve-CspmScope -Identifier $Scope
+    #     } else {
+    #         throw "Either -Scope or -TenantRoot must be specified."
+    #     }
+    #
+    #     # Build base KQL query
+    #     $query = "securityresources | where type == 'microsoft.security/governancerules' | extend scopeId = tostring(split(tolower(id), '/providers/microsoft.security/governancerules/')[0]) | where scopeId == tolower('$resolvedScope')"
+    #
+    #     # Optional filter by DisplayName (deterministic GUID)
+    #     if ($DisplayName) {
+    #         $ruleId = (ConvertTo-Guid $DisplayName).Guid
+    #         $query += "`n| where id endswith '$ruleId'"
+    #     }
+    #
+    #     # Build ARG request body
+    #     $body = @{ query = $query } | ConvertTo-Json -Depth 5
+    #
+    #     # ARG REST endpoint
+    #     $uri = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources`?api-version=2022-10-01"
+    #
+    #     try {
+    #         Write-Verbose "Querying ARG for governance rules..."
+    #         $response = Invoke-AzureRestMethod -Method POST -Uri $uri -Body $body -Headers (Get-AuthHeader) -ContentType 'application/json'
+    #
+    #         if (-not $response.data) {
+    #             Write-Warning "No governance rules found for scope: $resolvedScope"
+    #             return $response
+    #         }
+    #
+    #         # Return clean JSON
+    #         return ($response.data ) #| ConvertTo-Json -Depth 10)
+    #     } catch {
+    #         throw "Failed to query ARG for governance rules: $_"
+    #     }
+    # }
+
+
+    function Update-CspmGovernanceRule {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory)][string]$Scope,
+            [Parameter(Mandatory)][string]$DisplayName,
+            #[Parameter(Mandatory)][string[]]$AssessmentGuids,
+            [Parameter(Mandatory)][string]$OwnerGroup
+        )
+
+        $scope = Resolve-CspmScope -Identifier $Scope
+        #New-CspmGovernanceRule -Scope $Scope -DisplayName $DisplayName -AssessmentGuids $AssessmentGuids -OwnerGroup $OwnerGroup
+    }
+
+    function Remove-CspmGovernanceRule {
+        param (
+            [Parameter(Mandatory)][string]$Scope,
+            [Parameter(Mandatory)][string]$DisplayName
+        )
+
+        $scope = Resolve-CspmScope -Identifier $Scope
+        $ruleId = (ConvertTo-Guid $DisplayName).Guid
+        $uri = "https://management.azure.com/$Scope/providers/Microsoft.Security/governanceRules/$ruleId?api-version=2022-01-01-preview"
+
+        $response = Invoke-AzureRestMethod -Method DELETE -Uri $uri -Headers (Get-AuthHeader)
+        if($statusCode -eq '202'){
+            Write-Host "$($statusCode): Successfully Deleted $($DisplayName)" -ForegroundColor Green
+        }else{
+            Write-Error "$($statusCode): $($Error[0])"
+        }
+    }
+
+    function Execute-CspmGovernanceRule {
+        param (
+            [Parameter(Mandatory = $false)][string]$Scope,
+            [string]$DisplayName,
+            [Parameter(ValueFromPipeline)][string]$Id,
+            [switch]$TenantRoot,
+            [switch]$Override
+
+        )
+
+        # Determime Scope
+        if($TenantRoot){
+        # Resolve tenant root MG scope using tenant ID
+            $tenantId = (Get-AzContext).Tenant.Id
+            $resolvedScope = "/providers/Microsoft.Management/managementGroups/$tenantId"
+        }elseif($scope){
+            $resolvedScope = Resolve-CspmScope -Identifier $Scope
+        }else{
+            throw "Either -Scope or -TenantRoot must be specified."
+        }
+
+        # Deterministic GUID
+        if($id){
+            $ruleId = $id
+        }else{    
+            $ruleId = (ConvertTo-Guid $DisplayName).Guid
+        }
+
+        $uri = "https://management.azure.com/$resolvedScope/providers/Microsoft.Security/governanceRules/$ruleId/execute`?api-version=2022-01-01-preview"
+        
+        # Override Payload
+        if($override){
+            $body = @{
+                Override = $true
+            } | ConvertTo-Json
+        }
+        $response = Invoke-AzureRestMethod -ContentType 'application/json' -Method POST -Uri $uri -Headers (Get-AuthHeader) -Body $body
+        
+#         $locationUrl = ($response.Headers["Location"])[0]
+#         if (-not $locationUrl) {
+#             throw "No 'Location' header found. Cannot poll for status."
+#         }else{
+#             Write-Warning "$($locationUrl)"
+#         }
+#
+#         # Default retry value
+#         $retryAfter = 30
+#
+# # Get Retry-After header (if exists)
+#         $retryAfterHeader = $response.Headers["Retry-After"][0]
+#
+# # Declare variable before using [ref]
+#         $parsedRetry = 0
+#         if ($retryAfterHeader -and [double]::TryParse($retryAfterHeader, [ref]$parsedRetry)) {
+#             $retryAfter = $parsedRetry
+#         } else {
+#             Write-Warning "Retry-After header missing or invalid. Defaulting to $retryAfter seconds."
+#         }
+#
+#
+#         Write-Host "Polling status" -ForegroundColor Yellow -NoNewLine
+#
+#         # Begin polling loop
+#         $isComplete = $false
+#         $errorCount = 0
+#         while (-not $isComplete -and $errorCount -lt 5) {
+#             Start-Sleep -Seconds $retryAfter
+#
+#             try {
+#                 $pollResponse = Invoke-AzureRestMethod -ContentType 'application/json' -Uri $locationUrl -Method GET
+#                 try{
+#                     $pollHeaders = $pollResponse.Headers
+#                     $statusCode = $pollResponse.statusCode
+#                     $locationUrl = $pollHeaders['Location'][0]
+#                     $retryAfterHeader = $pollHeaders['Retry-After'][0]
+#                     $parsedRetry = 0
+#                     if ($retryAfterHeader -and [double]::TryParse($retryAfterHeader, [ref]$parsedRetry)) {
+#                         $retryAfter = $parsedRetry
+#                     } else {
+#                         Write-Warning "Retry-After header missing or invalid. Defaulting to $retryAfter seconds."
+#                     }
+#                     Write-Host "StatusCode: $($pollResponse.statusCode)"
+#                     Write-Host '...' -NoNewLine
+#                 }catch{
+#                     tryOnn
+#                         Write-Host ""
+#                         $status = ($pollResponse.RawContent | ConvertFrom-Json).Status
+#                         Write-Host "StatusCode: $($pollResponse.StatusCode) StatusDesc: $($pollresponse.StatusDescription) Status: $($status)" 
+#                         $isComplete = $true
+#                     }catch{
+#                         Write-Error "Some BS Error"
+#                         continue
+#                     }
+#                 }
+#             }
+#             catch {
+#                 $errorCount++
+#                 Write-Warning "Error polling location: $_"
+#                 $retryAfter = 60
+#             }
+#
+#         }
+        # Basic Error Handling
+        if($response.statusCode -eq '202'){
+            Write-Host "$($response.statusCode): Successfully Executed $($DisplayName)" -ForegroundColor Green
+            #$response.headers['location'] | ConvertTo-Json -Depth 10
+        }else{
+            Write-Error "$($response.statusCode): $($Error[0])"
+        }
+    }
+
+    #########################
+    ## Assessment Metadata ##
+    #########################
+
+    function Get-CspmAssessmentMetadata {
+        param(
+            [string]$Scope # = (Get-AzContext).Subscription.Id
+        )
+
+        try {
+            if($scope){
+                $resolvedScope = Resolve-CspmScope -Identifier $Scope
+            }
+            $uri = "https://management.azure.com/$resolvedScope/providers/Microsoft.Security/assessmentMetadata?api-version=2020-01-01"
+
+            $response = Invoke-AzureRestMethod -Method GET -Uri $uri -Headers (Get-AuthHeader) -ErrorAction Stop
+
+            if ($response) {
+                return $response
+            } else {
+                Write-Warning "No assessment metadata returned from $resolvedScope"
+                return @()
+            }
+        }
+        catch {
+            Write-Error "Failed to retrieve assessment metadata: $($_.Exception.Message)"
+        }
+    }
+} | Import-Module
