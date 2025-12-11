@@ -61,7 +61,7 @@ New-Module -Name Az.CSPM -ScriptBlock {
             }
         }
         catch {
-            Write-Error "Invoke-AzureRestMethod failed: $($_.Exception.Message)"
+            throw "Invoke-AzureRestMethod failed: $($_.Exception.Message)"
         }
     }
 
@@ -155,126 +155,177 @@ New-Module -Name Az.CSPM -ScriptBlock {
         throw "Object '$Identity' not found as User, Group, or Service Principal."
     }
 
-function New-AzRBACAssignment {
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory)][string]$ResourceName,
-        [Parameter(Mandatory)][string]$MemberName,
-        [Parameter(Mandatory)][string]$RoleDefinition,
+    function New-AzRBACAssignment {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory)][string]$Scope,
+            [Parameter(Mandatory)][string]$MemberName,
+            [Parameter(Mandatory)][string]$RoleDefinition,
 
-        [Parameter()][ValidateSet("Active", "Eligible")]
-        [string]$AssignmentType = "Active",
+            [Parameter()][ValidateSet("Active", "Eligible")]
+            [string]$AssignmentType = "Active",
 
-        [Parameter()][datetime]$StartDateTime,
+            [Parameter()][datetime]$StartDateTime,
 
-        [Parameter()][datetime]$EndDateTime,
+            [Parameter()][datetime]$EndDateTime,
 
-        [Parameter()][string]$Justification = "Automated RBAC/PIM assignment",
+            [Parameter()][string]$Justification = "Creating role assignment from RBAC Extension",
 
-        # Force only allows RBAC -> PIM conversion. It WILL remove permanent RBAC if present.
-        [Parameter()][switch]$Force
-    )
+            # Force only allows RBAC -> PIM conversion. It WILL remove permanent RBAC if present.
+            [Parameter()][switch]$Force
+        )
 
-    try {
-        # Resolve resource
-        $resource = Get-AzResource -Name $ResourceName -ErrorAction Stop
-        if (-not $resource -or $resource.Count -eq 0) { throw "Resource '$ResourceName' not found in the current subscription context." }
-        if ($resource.Count -gt 1) {
-            Write-Error "Multiple resources found with name '$ResourceName'. Specify ResourceId or ResourceGroupName/ResourceType."
-            $resource | Select-Object Name, ResourceType, ResourceGroupName, ResourceId
-            return
-        }
-        $scope = $resource[0].ResourceId
+        try {
+            # # Resolve resource
+            # $resource = Get-AzResource -Name $ResourceName -ErrorAction Stop
+            # if (-not $resource -or $resource.Count -eq 0) { throw "Resource '$ResourceName' not found in the current subscription context." }
+            # if ($resource.Count -gt 1) {
+            #     Write-Error "Multiple resources found with name '$ResourceName'. Specify ResourceId or ResourceGroupName/ResourceType."
+            #     $resource | Select-Object Name, ResourceType, ResourceGroupName, ResourceId
+            #     return
+            # }
+            # $scope = $resource[0].ResourceId
 
-        # Resolve principal
-        $entra = Get-AzAdObject -Identity $MemberName
-        if (-not $entra) { throw "Principal '$MemberName' not found." }
-        $principalId = $entra.Id
-
-        # Resolve role definition
-        $role = Get-AzRoleDefinition -Name $RoleDefinition -ErrorAction SilentlyContinue
-        if (-not $role) { $role = Get-AzRoleDefinition -Id $RoleDefinition -ErrorAction SilentlyContinue }
-        if (-not $role) { throw "Role definition '$RoleDefinition' not found." }
-        $roleDefinitionId = $role.Id
-
-        # If EndDateTime not provided => permanent RBAC path
-        if (-not $PSBoundParameters.ContainsKey('EndDateTime')) {
-            Write-Verbose "Permanent RBAC mode detected (no EndDateTime provided)."
-
-            $existing = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction SilentlyContinue
-
-            if ($existing) {
-                Write-Verbose "An existing permanent RBAC assignment already exists."
-                return $existing
+            # -------- Resolve Scope --------
+            if ($Scope) {
+                $scope = $Scope.TrimEnd('/')
+                if ($scope -notmatch '^/subscriptions/|^/providers/Microsoft.Management/managementGroups/|^/$'){
+                    throw "Invalid scope format. Must be tenant '/', management group, subscription, resource group, or resource."
+                }
+            }elseif($ResourceName){
+                $resource = Get-AzResource -Name $ResourceName -ErrorAction Stop
+                if (-not $resource -or $resource.Count -eq 0) {
+                    throw "Resource '$ResourceName' not found in the current subscription context."
+                }
+                if ($resource.Count -gt 1) {
+                    throw "Multiple resources found with name '$ResourceName'. Use -Scope with the full resourceId instead."
+                }
+                $scope = $resource[0].ResourceId
+            }else{
+                throw "You must specify either -Scope or -ResourceName."
             }
 
-            # Create permanent RBAC
-            return New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope
-        }
+            # Resolve principal
+            $entra = Get-AzAdObject -Identity $MemberName
+            if (-not $entra) { throw "Principal '$MemberName' not found." }
+            $principalId = $entra.Id
 
-        # ---------- PIM mode ----------
-        Write-Verbose "PIM mode ($AssignmentType)"
+            # Resolve role definition
+            $role = Get-AzRoleDefinition -Name $RoleDefinition -ErrorAction SilentlyContinue
+            if (-not $role) { $role = Get-AzRoleDefinition -Id $RoleDefinition -ErrorAction SilentlyContinue }
+            if (-not $role) { throw "Role definition '$RoleDefinition' not found." }
+            $roleDefinitionId = $role.Id
 
-        # Normalize Start/End
-        if (-not $StartDateTime) { $StartDateTime = Get-Date }
+            # If EndDateTime not provided => permanent RBAC path
+            if (-not $PSBoundParameters.ContainsKey('EndDateTime')) {
+                Write-Warning "Permanent RBAC mode detected (no EndDateTime provided)."
 
-        # If user supplied a date-only value it will have TimeOfDay == 00:00:00.
-        # Treat that as "end of that day local" for EndDateTime.
-        if ($EndDateTime.TimeOfDay.TotalSeconds -eq 0) {
-            $EndDateTime = $EndDateTime.Date.AddDays(1).AddSeconds(-1)
-        }
+                $existing = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction SilentlyContinue
 
-        $startUtc = $StartDateTime.ToUniversalTime().ToString("o")
-        $endUtc   = $EndDateTime.ToUniversalTime().ToString("o")
+                if ($existing) {
+                    Write-Warning "An existing permanent RBAC assignment already exists."
+                    return $existing
+                }
 
-        # Detect permanent RBAC existence
-        $rbac = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction SilentlyContinue
-
-        if ($rbac -and -not $Force) {
-            throw "Permanent RBAC assignment exists at scope $scope for principal $MemberName and role $RoleDefinition. Rerun with -Force to convert RBAC -> PIM."
-        }
-
-        if ($rbac -and $Force) {
-            Write-Warning "Force specified — converting permanent RBAC to PIM by removing existing RBAC assignment(s)."
-            foreach ($r in $rbac) {
-                # Use Remove-AzRoleAssignment to stay in Az module
-                Remove-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction Stop
-            }
-        }
-
-        # Find existing PIM assignments (schedules)
-        $pimUri = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentSchedules?api-version=2020-10-01"
-        $pimAssignments = Invoke-AzureRestMethod -Uri $pimUri -Method GET -ErrorAction SilentlyContinue
-
-        # If Invoke-AzureRestMethod paginates, it will return array. If single response, handle that.
-        $pimAssignments = @($pimAssignments) | Where-Object { $_ -ne $null }
-
-        $typeFilter = if ($AssignmentType -eq "Eligible") { "Eligible" } else { "Active" }
-
-        $existingPim = $pimAssignments | Where-Object {
-            ($_.principalId -eq $principalId) -and
-            ($_.roleDefinitionId -eq $roleDefinitionId) -and
-            ($_.scope -eq $scope) -and
-            ($_.assignmentType -eq $typeFilter)
-        }
-
-        # If PIM exists -> Auto-extend
-        if ($existingPim -and $existingPim.Count -gt 0) {
-            if ($existingPim.Count -gt 1) {
-                throw "Multiple PIM assignments found for principal/role/scope — manual intervention required."
+                # Create permanent RBAC
+                return New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope
             }
 
-            Write-Verbose "Existing PIM found — submitting extend request."
+            # ---------- PIM mode ----------
+            Write-Verbose "PIM mode ($AssignmentType)"
 
-            $extendUri = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentScheduleRequests?api-version=2020-10-01"
-            $extendBody = @{
+            # Normalize Start/End
+            if (-not $StartDateTime) { $StartDateTime = Get-Date }
+
+            # If user supplied a date-only value it will have TimeOfDay == 00:00:00.
+            # Treat that as "end of that day local" for EndDateTime.
+            if ($EndDateTime.TimeOfDay.TotalSeconds -eq 0) {
+                $EndDateTime = $EndDateTime.Date.AddDays(1).AddSeconds(-1)
+            }
+
+            $startUtc = $StartDateTime.ToUniversalTime().ToString("o")
+            $endUtc   = $EndDateTime.ToUniversalTime().ToString("o")
+
+            # Detect permanent RBAC existence
+            $rbac = Get-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction SilentlyContinue
+
+            if ($rbac -and -not $Force) {
+                throw "Permanent RBAC assignment exists at scope $scope for principal $MemberName and role $RoleDefinition. Rerun with -Force to convert RBAC -> PIM."
+            }
+
+            if ($rbac -and $Force) {
+                Write-Warning "Force specified — converting permanent RBAC to PIM by removing existing RBAC assignment(s)."
+                foreach ($r in $rbac) {
+                    # Use Remove-AzRoleAssignment to stay in Az module
+                    Remove-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $roleDefinitionId -Scope $scope -ErrorAction Stop
+                }
+            }
+
+            # Find existing PIM assignments (schedules)
+            $pimUri = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentSchedules?api-version=2020-10-01"
+            $pimAssignments = Invoke-AzureRestMethod -Uri $pimUri -Method GET -ErrorAction SilentlyContinue
+
+            # If Invoke-AzureRestMethod paginates, it will return array. If single response, handle that.
+            $pimAssignments = @($pimAssignments) | Where-Object { $_ -ne $null }
+
+            $typeFilter = if ($AssignmentType -eq "Eligible") { "Eligible" } else { "Active" }
+
+            $existingPim = $pimAssignments | Where-Object {
+                ($_.principalId -eq $principalId) -and
+                ($_.roleDefinitionId -eq $roleDefinitionId) -and
+                ($_.scope -eq $scope) -and
+                ($_.assignmentType -eq $typeFilter)
+            }
+
+            # If PIM exists -> Auto-extend
+            if ($existingPim -and $existingPim.Count -gt 0) {
+                if ($existingPim.Count -gt 1) {
+                    throw "Multiple PIM assignments found for principal/role/scope — manual intervention required."
+                }
+
+                Write-Verbose "Existing PIM found — submitting extend request."
+
+                $extendUri = "https://management.azure.com/$($scope)/providers/Microsoft.Authorization/roleAssignmentScheduleRequests?api-version=2020-10-01"
+                $extendBody = @{
+                    properties = @{
+                        requestType = "AdminExtend"
+                        principalId = $principalId
+                        roleDefinitionId = "/providers/Microsoft.Authorization/roleDefinitions/$($roleDefinitionId)"
+                        scope = $scope
+                        justification = $Justification
+                        scheduleInfo = @{
+                            expiration = @{
+                                type = "AfterDateTime"
+                                endDateTime = $endUtc
+                            }
+                        }
+                    }
+                } | ConvertTo-Json -Depth 10
+
+                $extendResp = Invoke-AzureRestMethod -Method POST -Uri $extendUri -Body $extendBody -ContentType "application/json"
+
+                if ($extendResp -and $extendResp.properties -and $extendResp.properties.status -eq "PendingApproval") {
+                    Write-Warning "PIM extend request submitted and is pending approval."
+                }
+
+                return $extendResp
+            }
+
+            # Create new PIM assignment
+            Write-Warning "Creating new PIM assignment"
+            $requestType = if ($AssignmentType -eq "Eligible") { "AdminAssignEligible" } else { "AdminAssign" }
+            $guid = (New-Guid).Guid
+            $createUri = "https://management.azure.com/$($scope)/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/$($guid)?api-version=2020-10-01"
+            $createBody = @{
                 properties = @{
-                    requestType = "AdminExtend"
+                    condition = $null
+                    conditionVersion = $null
+                    requestType = $requestType
                     principalId = $principalId
-                    roleDefinitionId = $roleDefinitionId
-                    scope = $scope
+                    roleDefinitionId = "/providers/Microsoft.Authorization/roleDefinitions/$($roleDefinitionId)"
                     justification = $Justification
                     scheduleInfo = @{
+                        startDateTime = "2025-12-02T01:14:46.139Z" #$startUtc
                         expiration = @{
                             type = "AfterDateTime"
                             endDateTime = $endUtc
@@ -282,49 +333,19 @@ function New-AzRBACAssignment {
                     }
                 }
             } | ConvertTo-Json -Depth 10
+            $response = Invoke-AzureRestMethod -Method PUT -Uri $createUri -Body $createBody -ContentType "application/json"
+            #Invoke-RestMethod -Method PUT -Uri $createUri -Body $createBody -Headers $header -ContentType "application/json" 
 
-            $extendResp = Invoke-AzureRestMethod -Method POST -Uri $extendUri -Body $extendBody -ContentType "application/json"
-
-            if ($extendResp -and $extendResp.properties -and $extendResp.properties.status -eq "PendingApproval") {
-                Write-Warning "PIM extend request submitted and is pending approval."
+            if ($response -and $response.properties -and $response.properties.status -eq "PendingApproval") {
+                Write-Warning "PIM create request submitted but is pending approval."
             }
 
-            return $extendResp
+            return $response
         }
-
-        # Create new PIM assignment
-        $requestType = if ($AssignmentType -eq "Eligible") { "AdminAssignEligible" } else { "AdminAssign" }
-        $createUri = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentScheduleRequests?api-version=2020-10-01"
-
-        $createBody = @{
-            properties = @{
-                requestType = $requestType
-                principalId = $principalId
-                roleDefinitionId = $roleDefinitionId
-                scope = $scope
-                justification = $Justification
-                scheduleInfo = @{
-                    startDateTime = $startUtc
-                    expiration = @{
-                        type = "AfterDateTime"
-                        endDateTime = $endUtc
-                    }
-                }
-            }
-        } | ConvertTo-Json -Depth 10
-
-        $response = Invoke-AzureRestMethod -Method POST -Uri $createUri -Body $createBody -ContentType "application/json"
-
-        if ($response -and $response.properties -and $response.properties.status -eq "PendingApproval") {
-            Write-Warning "PIM create request submitted but is pending approval."
+        catch {
+            throw "New-AzRBACAssignment failed: $($_.Exception.Message)"
         }
-
-        return $response
     }
-    catch {
-        throw "New-AzRBACAssignment failed: $($_.Exception.Message)"
-    }
-}
 
     # function Invoke-CspmAzGraphQuery {
     #     [CmdletBinding()]
@@ -676,113 +697,126 @@ function New-AzRBACAssignment {
     }
 
     function Execute-CspmGovernanceRule {
+        [CmdletBinding()]
         param (
-            [Parameter(Mandatory = $false)][string]$Scope,
+            [Parameter(Mandatory = $false)]
+            [string]$Scope,
             [string]$DisplayName,
-            [Parameter(ValueFromPipeline)][string]$Id,
+            [Parameter(ValueFromPipeline)]
+            [string]$Id,
             [switch]$TenantRoot,
-            [switch]$Override
-
+            [switch]$Override,
+            [int]$TimeoutSeconds = 1800 #900  # 15 min hard stop
         )
 
-        # Determime Scope
-        if($TenantRoot){
-        # Resolve tenant root MG scope using tenant ID
+        # -----------------------------
+        # Resolve Scope
+        # -----------------------------
+        if ($TenantRoot){
             $tenantId = (Get-AzContext).Tenant.Id
-            $resolvedScope = "/providers/Microsoft.Management/managementGroups/$tenantId"
-        }elseif($scope){
+            $resolvedScope = "/providers/microsoft.management/managementgroups/$tenantId"
+        }elseif($Scope){
             $resolvedScope = Resolve-CspmScope -Identifier $Scope
         }else{
             throw "Either -Scope or -TenantRoot must be specified."
         }
 
-        # Deterministic GUID
-        if($id){
-            $ruleId = $id
-        }else{    
-            $ruleId = (ConvertTo-Guid $DisplayName).Guid
+        # -----------------------------
+        # Resolve Rule ID
+        # -----------------------------
+        $ruleId = if($Id){
+            $Id
+        }else{
+            (ConvertTo-Guid $DisplayName).Guid
         }
 
-        $uri = "https://management.azure.com/$resolvedScope/providers/Microsoft.Security/governanceRules/$ruleId/execute`?api-version=2022-01-01-preview"
-        
-        # Override Payload
-        if($override){
-            $body = @{
-                Override = $true
-            } | ConvertTo-Json
-        }
-        $response = Invoke-AzureRestMethod -ContentType 'application/json' -Method POST -Uri $uri -Headers (Get-AuthHeader) -Body $body
-        
-#         $locationUrl = ($response.Headers["Location"])[0]
-#         if (-not $locationUrl) {
-#             throw "No 'Location' header found. Cannot poll for status."
-#         }else{
-#             Write-Warning "$($locationUrl)"
-#         }
-#
-#         # Default retry value
-#         $retryAfter = 30
-#
-# # Get Retry-After header (if exists)
-#         $retryAfterHeader = $response.Headers["Retry-After"][0]
-#
-# # Declare variable before using [ref]
-#         $parsedRetry = 0
-#         if ($retryAfterHeader -and [double]::TryParse($retryAfterHeader, [ref]$parsedRetry)) {
-#             $retryAfter = $parsedRetry
-#         } else {
-#             Write-Warning "Retry-After header missing or invalid. Defaulting to $retryAfter seconds."
-#         }
-#
-#
-#         Write-Host "Polling status" -ForegroundColor Yellow -NoNewLine
-#
-#         # Begin polling loop
-#         $isComplete = $false
-#         $errorCount = 0
-#         while (-not $isComplete -and $errorCount -lt 5) {
-#             Start-Sleep -Seconds $retryAfter
-#
-#             try {
-#                 $pollResponse = Invoke-AzureRestMethod -ContentType 'application/json' -Uri $locationUrl -Method GET
-#                 try{
-#                     $pollHeaders = $pollResponse.Headers
-#                     $statusCode = $pollResponse.statusCode
-#                     $locationUrl = $pollHeaders['Location'][0]
-#                     $retryAfterHeader = $pollHeaders['Retry-After'][0]
-#                     $parsedRetry = 0
-#                     if ($retryAfterHeader -and [double]::TryParse($retryAfterHeader, [ref]$parsedRetry)) {
-#                         $retryAfter = $parsedRetry
-#                     } else {
-#                         Write-Warning "Retry-After header missing or invalid. Defaulting to $retryAfter seconds."
-#                     }
-#                     Write-Host "StatusCode: $($pollResponse.statusCode)"
-#                     Write-Host '...' -NoNewLine
-#                 }catch{
-#                     tryOnn
-#                         Write-Host ""
-#                         $status = ($pollResponse.RawContent | ConvertFrom-Json).Status
-#                         Write-Host "StatusCode: $($pollResponse.StatusCode) StatusDesc: $($pollresponse.StatusDescription) Status: $($status)" 
-#                         $isComplete = $true
-#                     }catch{
-#                         Write-Error "Some BS Error"
-#                         continue
-#                     }
-#                 }
-#             }
-#             catch {
-#                 $errorCount++
-#                 Write-Warning "Error polling location: $_"
-#                 $retryAfter = 60
-#             }
-#
-#         }
-        # Basic Error Handling
-        if($response.statusCode -eq '202'){
-            Write-Host "$($response.statusCode): Successfully Executed $($DisplayName)" -ForegroundColor Green
-            #$response.headers['location'] | ConvertTo-Json -Depth 10
+        # -----------------------------
+        # Build URI + Body
+        # -----------------------------
+        $uri = "https://management.azure.com/$resolvedScope/providers/Microsoft.Security/governanceRules/$ruleId/execute?api-version=2022-01-01-preview"
+
+        $body = if($Override){
+            @{Override = $true } | ConvertTo-Json
         }else{
-            Write-Error "$($response.statusCode): $($Error[0])"
+            $null
+        }
+
+        Write-Host "Executing governance rule $ruleId" -ForegroundColor Magenta
+
+        # -----------------------------
+        # Fire Initial Execute
+        # -----------------------------
+        $response = Invoke-AzureRestMethod -Method POST -Uri $uri -ContentType 'application/json' -Headers (Get-AuthHeader) -Body $body
+        
+        if ($response.StatusCode -ne 202) {
+            throw "Execution failed immediately. StatusCode: $($response.StatusCode)"
+        }
+
+        # -----------------------------
+        # Extract Polling Headers
+        # -----------------------------
+        $locationUrl = $response.Headers['Location'] | Select-Object -First 1
+        if (-not $locationUrl) {
+            throw "No Location header returned from execution. Cannot poll."
+        }
+
+        $retryAfter = 60
+        #$retryHeader = $response.Headers['Retry-After'] | Select-Object -First 1
+        #if ($retryHeader -and [int]::TryParse($retryHeader, [ref]$retryAfter)) { }
+
+        Write-Host "Execution accepted (202). Polling..." -ForegroundColor Cyan
+        Write-Host "Poll URL: $locationUrl" -ForegroundColor DarkGray
+        Write-Host "Initial Retry-After: $retryAfter sec" -ForegroundColor DarkGray
+
+        # -----------------------------
+        # Poll Loop
+        # -----------------------------
+        $startTime   = Get-Date
+        $isComplete  = $false
+        $lastStatus  = $null
+
+        while (-not $isComplete) {
+
+            Start-Sleep -Seconds $retryAfter
+
+            # Timeout Guard
+            if ((Get-Date) -gt $startTime.AddSeconds($TimeoutSeconds)) {
+                throw "Polling timed out after $TimeoutSeconds seconds."
+            }
+
+            try {
+                $pollResponse = Invoke-AzureRestMethod -Method GET -Uri $locationUrl -Headers (Get-AuthHeader) -Paginate $false
+                $pollResponse
+                Write-Host "test $($pollResponse.StatusCode)"
+                $statusCode = $pollResponse.StatusCode
+                $headers    = $pollResponse.Headers
+
+                # Update Retry-After if present
+                #$retryHeader = $headers['Retry-After'] | Select-Object -First 1
+                #if ($retryHeader -and [int]::TryParse($retryHeader, [ref]$retryAfter)) { }
+
+                # Terminal response often comes back as 200 with body
+                if ($statusCode -eq 200) {
+                    $bodyJson = $pollResponse.Content | ConvertFrom-Json
+                    $lastStatus = $bodyJson.status
+
+                    Write-Host "Final Status: $lastStatus" -ForegroundColor Green
+                    return $bodyJson
+                }
+
+                # Still running → 202
+                if ($statusCode -eq 202) {
+                    $locationUrl = $headers['Location'] | Select-Object -First 1
+                    Write-Host "Still running... next check in $retryAfter sec" -ForegroundColor Yellow
+                    continue
+                }
+
+                # Unexpected but non-terminal
+                Write-Warning "Unexpected poll status: $statusCode"
+            }catch{
+                Write-Warning "Polling error: $($_.Exception.Message). Retrying in 60 sec."
+                $retryAfter = 60
+            }
         }
     }
 
