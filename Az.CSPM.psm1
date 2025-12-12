@@ -133,28 +133,6 @@ New-Module -Name Az.CSPM -ScriptBlock {
         throw "Could not resolve identifier '$Identifier' as either a subscription or connector name."
     }
 
-    function Get-AzAdObject {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory=$true)]
-            [string]$Identity
-        )
-
-        # Try user
-        $user = Get-AzADUser -Filter "userPrincipalName eq '$Identity' or displayName eq '$Identity'" -ErrorAction SilentlyContinue
-        if ($user) { return $user }
-
-        # Try group
-        $group = Get-AzADGroup -Filter "displayName eq '$Identity'" -ErrorAction SilentlyContinue
-        if ($group) { return $group }
-
-        # Try service principal
-        $sp = Get-AzADServicePrincipal -Filter "displayName eq '$Identity'" -ErrorAction SilentlyContinue
-        if ($sp) { return $sp }
-
-        throw "Object '$Identity' not found as User, Group, or Service Principal."
-    }
-
     function New-AzRBACAssignment {
         [CmdletBinding()]
         param (
@@ -262,7 +240,8 @@ New-Module -Name Az.CSPM -ScriptBlock {
             }
 
             # Find existing PIM assignments (schedules)
-            $pimUri = "https://management.azure.com/providers/Microsoft.Authorization/roleAssignmentSchedules?api-version=2020-10-01"
+            Write-Verbose "Finding Existing PIM assignments"
+            $pimUri = "https://management.azure.com/$($scope)/providers/Microsoft.Authorization/roleAssignmentSchedules?api-version=2020-10-01"
             $pimAssignments = Invoke-AzureRestMethod -Uri $pimUri -Method GET -ErrorAction SilentlyContinue
 
             # If Invoke-AzureRestMethod paginates, it will return array. If single response, handle that.
